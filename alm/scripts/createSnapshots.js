@@ -17,6 +17,8 @@ const {
   ALM_HOME_EXPLORER_API
 } = process.env
 
+const STARTING_PAGING_SIZE = 10_000_000
+
 const generateSnapshot = async (side, url, bridgeAddress) => {
   const snapshotPath = `../src/snapshots/${side}.json`
   const snapshotFullPath = path.join(__dirname, snapshotPath)
@@ -25,26 +27,45 @@ const generateSnapshot = async (side, url, bridgeAddress) => {
   const web3 = new Web3(new Web3.providers.HttpProvider(url))
   const api = side === 'home' ? ALM_HOME_EXPLORER_API : ALM_FOREIGN_EXPLORER_API
 
-  const getPastEventsWithFallback = (contract, eventName, options) =>
+  const getPastEventsWithFallback = async (contract, eventName, options, pagingSize = STARTING_PAGING_SIZE) =>
     contract.getPastEvents(eventName, options).catch(async e => {
-      if (e.message.includes('exceed maximum block range')) {
+      if (e.message.includes('block range') || e.message.includes('timeout')) {
         const abi = contract.options.jsonInterface.find(abi => abi.type === 'event' && abi.name === eventName)
 
-        const url = new URL(api)
-        url.searchParams.append('module', 'logs')
-        url.searchParams.append('action', 'getLogs')
-        url.searchParams.append('address', contract.options.address)
-        url.searchParams.append('fromBlock', options.fromBlock)
-        url.searchParams.append('toBlock', options.toBlock || 'latest')
-        url.searchParams.append('topic0', web3.eth.abi.encodeEventSignature(abi))
+        const originalToBlock = options.toBlock
+        options.toBlock = Math.min(options.toBlock, options.fromBlock + pagingSize - 1)
+        const pastEvents = []
 
-        const logs = await fetch(url).then(res => res.json())
+        while (options.fromBlock !== originalToBlock) {
+          const url = new URL(api)
+          url.searchParams.append('module', 'logs')
+          url.searchParams.append('action', 'getLogs')
+          url.searchParams.append('address', contract.options.address)
+          url.searchParams.append('fromBlock', options.fromBlock)
+          url.searchParams.append('toBlock', options.toBlock || 'latest')
+          url.searchParams.append('topic0', web3.eth.abi.encodeEventSignature(abi))
+          let logs
+          try {
+            const fetchRes = await fetch(url)
+            logs = await fetchRes.json()
+          } catch (err) {
+            if (err.message.includes('canceled due to enabled timeout') || err.message.includes('Unexpected token <')) {
+              logs = await getPastEventsWithFallback(contract, eventName, options, pagingSize / 2)
+            } else {
+              throw err
+            }
+          }
+          const res = logs.result.map(log => ({
+            transactionHash: log.transactionHash,
+            blockNumber: parseInt(log.blockNumber.slice(2), 16),
+            returnValues: web3.eth.abi.decodeLog(abi.inputs, log.data, log.topics.slice(1))
+          }))
+          pastEvents.push(...res)
 
-        return logs.result.map(log => ({
-          transactionHash: log.transactionHash,
-          blockNumber: parseInt(log.blockNumber.slice(2), 16),
-          returnValues: web3.eth.abi.decodeLog(abi.inputs, log.data, log.topics.slice(1))
-        }))
+          options.fromBlock = Math.min(options.toBlock + 1, originalToBlock)
+          options.toBlock = Math.min(options.fromBlock + pagingSize - 1, originalToBlock)
+        }
+        return pastEvents
       }
       throw e
     })
